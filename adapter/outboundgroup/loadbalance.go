@@ -22,7 +22,13 @@ import (
 const (
 	maxRetryConsistentHashing = 5
 	maxRetryStickySessions    = 5
-	maxRetryBatchSize         = 10
+	// maxRetryBatchSize controls how many proxies are attempted in parallel per batch.
+	// Value 10 provides a balance between:
+	//   - Latency reduction: Parallel execution avoids sequential waiting when many proxies are slow/unavailable
+	//   - Resource usage: Limits concurrent connections to prevent overwhelming the system
+	//   - Diminishing returns: Beyond ~10 parallel attempts, additional concurrency yields minimal latency improvement
+	// This batch size ensures efficient retry behavior while maintaining system stability.
+	maxRetryBatchSize = 10
 )
 
 type strategyFn = func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy
@@ -94,10 +100,37 @@ type connectable interface {
 	AppendToChains(lb C.ProxyAdapter)
 }
 
-// retryWithProxies executes the try function with proxies until success or all exhausted
+// retryWithProxies attempts to establish a connection using the provided proxies,
+// returning on the first successful attempt or after all proxies are exhausted.
+//
+// Batch Retry Strategy:
+//   - Proxies are selected using the load balancer's strategy function (round-robin,
+//     consistent-hashing, or sticky-sessions).
+//   - Attempts are organized into batches of up to maxRetryBatchSize proxies.
+//   - Each batch executes in parallel to minimize total wait time when many proxies
+//     are slow or unavailable.
+//
+// Parallel Execution:
+//   - All proxies in a batch are tried concurrently via goroutines.
+//   - A cancellable context derived from the caller's context allows immediate
+//     termination of all goroutines once any proxy succeeds.
+//   - Results are collected via a buffered channel; the first successful connection
+//     triggers cancellation and returns immediately.
+//
+// Error Reporting:
+//   - On success: The successful connection is appended to chains and returned.
+//   - On complete failure: After all proxies are exhausted, every failure is reported
+//     to lb.onDialFailed to trigger appropriate health checks. The last error is
+//     returned to the caller.
+//
+// Context Handling:
+//   - The caller's context is respected (e.g., overall timeout/cancellation).
+//   - An internal cancellation mechanism stops remaining attempts as soon as
+//     one proxy succeeds, avoiding wasted resources.
+//
 // T must be a connectable type (C.Conn or C.PacketConn)
-// Uses parallel batch processing to reduce total wait time when many proxies are unavailable.
 func retryWithProxies[T connectable](
+	ctx context.Context,
 	lb *LoadBalance,
 	proxies []C.Proxy,
 	metadata *C.Metadata,
@@ -117,15 +150,19 @@ func retryWithProxies[T connectable](
 	}
 
 	tried := make(map[string]bool, len(proxies))
-	var lastFailedProxy C.Proxy
-	var lastFailedErr error
+	var failedResults []resultItem // collect all failed attempts
 
-	// Use a cancellable context to signal remaining goroutines to exit
-	ctx, cancel := context.WithCancel(context.Background())
+	// Use a cancellable context derived from the caller's context
+	// to respect external cancellation/timeout while also allowing
+	// internal cancellation when one proxy succeeds
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	for {
-		// Collect a batch of up to maxRetryBatchSize untried proxies
+		// Batch Collection: Select up to maxRetryBatchSize untried proxies.
+		// The strategy function provides the primary selection; if it returns
+		// an already-tried proxy, we fall back to scanning for any remaining
+		// untried proxy to ensure progress.
 		batch := make([]C.Proxy, 0, maxRetryBatchSize)
 		for i := 0; i < maxRetryBatchSize; i++ {
 			proxy := lb.strategyFn(proxies, metadata, true)
@@ -156,7 +193,10 @@ func retryWithProxies[T connectable](
 			break
 		}
 
-		// Execute batch in parallel
+		// Parallel Execution: Launch a goroutine for each proxy in the batch.
+		// Each goroutine attempts the connection and sends its result to the channel.
+		// The context is checked before attempting and when sending results to
+		// avoid unnecessary work after cancellation.
 		resultChan := make(chan resultItem, len(batch))
 		var wg sync.WaitGroup
 
@@ -188,7 +228,10 @@ func retryWithProxies[T connectable](
 			close(resultChan)
 		}()
 
-		// Collect results; return immediately on first success
+		// Result Collection: Process results as they arrive.
+		// - First success triggers immediate cancellation of remaining attempts,
+		//   appends the connection to chains, and returns.
+		// - All failures are collected for later reporting to health checks.
 		for res := range resultChan {
 			if res.err == nil {
 				// Success: append to chains, cancel others, and return
@@ -196,28 +239,31 @@ func retryWithProxies[T connectable](
 				res.conn.AppendToChains(lb)
 				return res.conn, nil
 			}
-			// Capture error for the last proxy in this batch
-			if res.idx == len(batch)-1 {
-				lastFailedProxy = res.proxy
-				lastFailedErr = res.err
-			}
+			// Capture all failures
+			failedResults = append(failedResults, res)
 		}
 
 		// Batch failed; continue to next batch if there are untried proxies
 		// Note: All goroutines from this batch have completed (or cancelled)
 	}
 
-	// All proxies failed
-	if lastFailedProxy != nil && lastFailedErr != nil {
-		lb.onDialFailed(lastFailedProxy.Type(), lastFailedErr, lb.healthCheck)
+	// All proxies failed - report each failure to onDialFailed
+	if len(failedResults) > 0 {
+		// Report all failures to trigger health checks appropriately
+		for _, res := range failedResults {
+			lb.onDialFailed(res.proxy.Type(), res.err, lb.healthCheck)
+		}
+		// Return the last error (most recent failure)
+		return zero, failedResults[len(failedResults)-1].err
 	}
-	return zero, lastFailedErr
+	// Should not reach here if proxies existed, but return a generic error
+	return zero, errors.New("all proxies failed")
 }
 
 // DialContext implements C.ProxyAdapter
 func (lb *LoadBalance) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
 	proxies := lb.GetProxies(true)
-	c, err = retryWithProxies[C.Conn](lb, proxies, metadata, func(proxy C.Proxy) (C.Conn, error) {
+	c, err = retryWithProxies[C.Conn](ctx, lb, proxies, metadata, func(proxy C.Proxy) (C.Conn, error) {
 		conn, err := proxy.DialContext(ctx, metadata)
 		if err == nil {
 			if N.NeedHandshake(conn) {
@@ -239,7 +285,7 @@ func (lb *LoadBalance) DialContext(ctx context.Context, metadata *C.Metadata) (c
 // ListenPacketContext implements C.ProxyAdapter
 func (lb *LoadBalance) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (pc C.PacketConn, err error) {
 	proxies := lb.GetProxies(true)
-	pc, err = retryWithProxies[C.PacketConn](lb, proxies, metadata, func(proxy C.Proxy) (C.PacketConn, error) {
+	pc, err = retryWithProxies[C.PacketConn](ctx, lb, proxies, metadata, func(proxy C.Proxy) (C.PacketConn, error) {
 		return proxy.ListenPacketContext(ctx, metadata)
 	})
 	return pc, err
